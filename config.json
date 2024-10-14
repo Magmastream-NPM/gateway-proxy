@@ -1,0 +1,27 @@
+{
+    "log_level": "info",
+    "token": "",
+    "intents": 3248863,
+    "port": 35101,
+    "activity": {
+        "type": 0,
+        "name": "on shard {{shard}} with kubernetes"
+    },
+    "status": "idle",
+    "backpressure": 100,
+    "validate_token": true,
+    "externally_accessible_url": "ws://na1.blackforthosting.com:35101",
+    "cache": {
+        "channels": true,
+        "presences": true,
+        "emojis": true,
+        "current_member": true,
+        "members": true,
+        "roles": true,
+        "scheduled_events": true,
+        "stage_instances": true,
+        "stickers": true,
+        "users": true,
+        "voice_states": true
+    }
+}
