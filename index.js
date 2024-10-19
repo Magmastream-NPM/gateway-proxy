@@ -20,22 +20,25 @@ if (cluster.isMaster) {
 } else {
 	const wss = new WebSocket.Server({ port: config.port });
 	const shardConnections = new Map();
-	const availableShards = [...Array(config.totalShards).keys()];
+	const availableShards = config.botTokens.flatMap(bot => [...Array(bot.totalShards).keys()].map(i => ({ botToken: bot.token, shardId: i })));
 
 	wss.on("connection", async (clientSocket) => {
 		console.log("Client connected to the proxy");
 
 		if (availableShards.length === 0) {
 			clientSocket.close(1008, "No available shards");
+			console.log("No available shards to connect.");
 			return;
 		}
 
-		const shardId = availableShards.shift();
+		const { botToken, shardId } = availableShards.shift();
+		console.log(`Connecting to Discord with Bot Token: ${botToken}, Shard ID: ${shardId}`);
 
 		try {
-			const discordWsUrl = await getDiscordGatewayUrl();
+			const discordWsUrl = await getDiscordGatewayUrl(botToken);
+			console.log(`Discord WebSocket URL for Bot Token: ${botToken} is ${discordWsUrl}`);
 			const discordSocket = new WebSocket(`${discordWsUrl}?v=10&encoding=json`);
-			shardConnections.set(shardId, { discordSocket, clientSocket });
+			shardConnections.set(`${botToken}-${shardId}`, { discordSocket, clientSocket });
 
 			// Handle Discord WebSocket events
 			discordSocket.on("message", (message) => {
@@ -48,17 +51,17 @@ if (cluster.isMaster) {
 			});
 
 			discordSocket.on("close", (code, reason) => {
-				console.log(`Discord WebSocket for Shard ${shardId} closed: ${code} ${reason}`);
+				console.log(`Discord WebSocket for Bot Token: ${botToken}, Shard ${shardId} closed: ${code} ${reason}`);
 				clientSocket.close();
-				shardConnections.delete(shardId);
-				availableShards.push(shardId);
+				shardConnections.delete(`${botToken}-${shardId}`);
+				availableShards.push({ botToken, shardId });
 			});
 
 			discordSocket.on("error", (error) => {
-				console.error(`Discord WebSocket for Shard ${shardId} error:`, error);
+				console.error(`Discord WebSocket for Bot Token: ${botToken}, Shard ${shardId} error:`, error);
 				clientSocket.close();
-				shardConnections.delete(shardId);
-				availableShards.push(shardId);
+				shardConnections.delete(`${botToken}-${shardId}`);
+				availableShards.push({ botToken, shardId });
 			});
 
 			// Handle client WebSocket events
@@ -72,22 +75,22 @@ if (cluster.isMaster) {
 			});
 
 			clientSocket.on("close", () => {
-				console.log(`Client for Shard ${shardId} disconnected`);
+				console.log(`Client for Bot Token: ${botToken}, Shard ${shardId} disconnected`);
 				discordSocket.close();
-				shardConnections.delete(shardId);
-				availableShards.push(shardId);
+				shardConnections.delete(`${botToken}-${shardId}`);
+				availableShards.push({ botToken, shardId });
 			});
 
 			clientSocket.on("error", (error) => {
-				console.error(`Client WebSocket for Shard ${shardId} error:`, error);
+				console.error(`Client WebSocket for Bot Token: ${botToken}, Shard ${shardId} error:`, error);
 				discordSocket.close();
-				shardConnections.delete(shardId);
-				availableShards.push(shardId);
+				shardConnections.delete(`${botToken}-${shardId}`);
+				availableShards.push({ botToken, shardId });
 			});
 		} catch (error) {
 			console.error("Error during connection handling:", error);
 			clientSocket.close(1011, "Internal server error");
-			availableShards.push(shardId);
+			availableShards.push({ botToken, shardId });
 		}
 	});
 

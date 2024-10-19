@@ -1,27 +1,34 @@
 const axios = require("axios");
 
-const config = require("../config.json");
-let cachedDiscordGatewayUrl = null;
-let cacheTimestamp = 0;
+let cachedDiscordGatewayUrls = {};
 const CACHE_EXPIRY = 3600000;
 
-async function getDiscordGatewayUrl() {
+// Delay function
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function getDiscordGatewayUrl(botToken) {
 	const now = Date.now();
-	if (cachedDiscordGatewayUrl && now - cacheTimestamp < CACHE_EXPIRY) {
-		return cachedDiscordGatewayUrl;
+	if (cachedDiscordGatewayUrls[botToken] && now - cachedDiscordGatewayUrls[botToken].timestamp < CACHE_EXPIRY) {
+		return cachedDiscordGatewayUrls[botToken].url;
 	}
+
+	await delay(8000);
 
 	try {
 		const response = await axios.get("https://discord.com/api/v10/gateway/bot", {
 			headers: {
-				Authorization: `Bot ${config.token}`,
+				Authorization: `Bot ${botToken}`,
 			},
 		});
-		cachedDiscordGatewayUrl = response.data.url;
-		cacheTimestamp = now;
-		return cachedDiscordGatewayUrl;
+		cachedDiscordGatewayUrls[botToken] = { url: response.data.url, timestamp: now };
+		return cachedDiscordGatewayUrls[botToken].url;
 	} catch (error) {
-		console.error("Failed to retrieve Discord Gateway URL:", error);
+		// Enhanced error logging
+		if (error.response) {
+			console.error("Failed to retrieve Discord Gateway URL:", error.response.data);
+		} else {
+			console.error("Failed to retrieve Discord Gateway URL:", error.message);
+		}
 		throw new Error("Unable to get Discord Gateway URL");
 	}
 }

@@ -1,5 +1,13 @@
 {
-    "token": "",
-    "totalShards": 1,
-    "port": 8080
+	"port": 8080,
+	"botTokens": [
+		{
+			"token": "",
+			"totalShards": 1
+		},
+        {
+            "token": "",
+            "totalShards": 1
+        }
+	]
 }
