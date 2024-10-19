@@ -1,116 +1,103 @@
 const WebSocket = require("ws");
-const http = require("http");
-const { EventEmitter } = require("events");
-const crypto = require("crypto");
-const { promisify } = require("util");
-const setTimeoutPromise = promisify(setTimeout);
-const { InMemoryCache } = require("./InMemoryCache");
-const { CONFIG } = require("./config");
-const { events } = require("./dispatch");
-const { Guilds } = require("./cache");
-const { Ready, Shard, StateInner } = require("./state");
-const { runServer } = require("./server");
-const CloseFrame = require("./closeCodes");
+const axios = require("axios");
+const config = require("./config.json");
 
-const SHUTDOWN = { value: false };
+let cachedDiscordGatewayUrl = null;
+let cacheTimestamp = 0;
+const CACHE_EXPIRY = 3600000;
 
-async function run() {
+async function getDiscordGatewayUrl() {
+	const now = Date.now();
+	if (cachedDiscordGatewayUrl && now - cacheTimestamp < CACHE_EXPIRY) {
+		return cachedDiscordGatewayUrl;
+	}
+
 	try {
-		// Set up metrics collection (could be done with prom-client in JS)
-		console.log("Setting up metrics");
-
-		// Create a HTTP Client
-		const client = createClient(CONFIG.token);
-
-		// Check total shards required
-		const gateway = await client.getGatewayBot();
-		const session = gateway.session_start_limit;
-		const shardCount = CONFIG.shards || gateway.shards;
-
-		const queue = createQueue(session.max_concurrency, session.remaining, session.reset_after, session.total);
-
-		const shardStart = CONFIG.shard_start || 0;
-		const shardEnd = CONFIG.shard_end || shardCount;
-		const shards = [];
-
-		console.log(`Creating shards ${shardStart} to ${shardEnd - 1} of ${shardCount} total`);
-
-		const readyState = new Ready();
-		const dispatchTasks = [];
-
-		for (let shardId = shardStart; shardId < shardEnd; shardId++) {
-			const guildCache = new Guilds(new InMemoryCache());
-
-			const shardStatus = new Shard({
-				id: shardId,
-				sender: createWebSocketSender(shardId, CONFIG.token),
-				events: new EventEmitter(),
-				ready: readyState,
-				guilds: guildCache,
-			});
-
-			dispatchTasks.push(events(shardStatus, shardId));
-			shards.push(shardStatus);
-		}
-
-		const state = new StateInner(shards, shardCount, new Map());
-
-		await runServer(CONFIG.port, state); // Server to handle incoming connections
-
-		process.on("SIGINT", () => handleShutdown(state));
-		process.on("SIGTERM", () => handleShutdown(state));
-
-		console.log("All shards created successfully");
-	} catch (e) {
-		console.error("Fatal error:", e);
+		const response = await axios.get("https://discord.com/api/v10/gateway/bot", {
+			headers: {
+				Authorization: `Bot ${config.token}`,
+			},
+		});
+		cachedDiscordGatewayUrl = response.data.url;
+		cacheTimestamp = now;
+		return cachedDiscordGatewayUrl;
+	} catch (error) {
+		console.error("Failed to retrieve Discord Gateway URL:", error);
+		throw new Error("Unable to get Discord Gateway URL");
 	}
 }
 
-function createClient(token) {
-	// Placeholder for creating HTTP client (e.g., using Axios or native http)
-	return {
-		getGatewayBot: async function () {
-			// This would call Discord's API for the gateway bot details
-			return {
-				shards: 1,
-				session_start_limit: {
-					total: 1000,
-					remaining: 500,
-					reset_after: 3600000,
-					max_concurrency: 1,
-				},
-			};
-		},
-	};
-}
+const wss = new WebSocket.Server({ port: config.port });
+const shardConnections = new Map();
+const availableShards = [...Array(config.totalShards).keys()];
 
-function createQueue(concurrency, remaining, resetAfter, total) {
-	// Placeholder for queue logic
-	console.log(`Setting up queue with concurrency ${concurrency}`);
-	return {};
-}
+wss.on("connection", async (clientSocket) => {
+	console.log("Client connected to the proxy");
 
-function createWebSocketSender(shardId, token) {
-	// Placeholder for WebSocket connection (can be used with ws)
-	return {
-		send: (data) => console.log(`Shard ${shardId} sending data:`, data),
-		close: (code) => console.log(`Shard ${shardId} closing connection with code ${code}`),
-	};
-}
-
-async function handleShutdown(state) {
-	console.log("Shutting down...");
-	SHUTDOWN.value = true;
-
-	// Close all shard connections gracefully
-	for (let shard of state.shards) {
-		shard.sender.close(CloseFrame.NORMAL);
+	if (availableShards.length === 0) {
+		clientSocket.close(1008, "No available shards");
+		return;
 	}
 
-	await setTimeoutPromise(10000); // Simulate waiting for graceful shutdown
+	const shardId = availableShards.shift();
 
-	console.log("Shutdown complete.");
-}
+	try {
+		const discordWsUrl = await getDiscordGatewayUrl();
+		const discordSocket = new WebSocket(`${discordWsUrl}?v=10&encoding=json`);
+		shardConnections.set(shardId, { discordSocket, clientSocket });
 
-// Simulate running the function
-run();
+		// Handle Discord WebSocket events
+		discordSocket.on("message", (message) => {
+			try {
+				const jsonMessage = JSON.parse(message);
+				clientSocket.send(JSON.stringify(jsonMessage));
+			} catch (error) {
+				console.error("Failed to parse message from Discord:", error);
+			}
+		});
+
+		discordSocket.on("close", (code, reason) => {
+			console.log(`Discord WebSocket for Shard ${shardId} closed: ${code} ${reason}`);
+			clientSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+
+		discordSocket.on("error", (error) => {
+			console.error(`Discord WebSocket for Shard ${shardId} error:`, error);
+			clientSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+
+		// Handle client WebSocket events
+		clientSocket.on("message", (message) => {
+			try {
+				const jsonMessage = JSON.parse(message);
+				discordSocket.send(JSON.stringify(jsonMessage));
+			} catch (error) {
+				console.error("Failed to parse message from client:", error);
+			}
+		});
+
+		clientSocket.on("close", () => {
+			console.log(`Client for Shard ${shardId} disconnected`);
+			discordSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+
+		clientSocket.on("error", (error) => {
+			console.error(`Client WebSocket for Shard ${shardId} error:`, error);
+			discordSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+	} catch (error) {
+		console.error("Error during connection handling:", error);
+		clientSocket.close(1011, "Internal server error");
+		availableShards.push(shardId);
+	}
+});
+
+console.log(`Proxy WebSocket server running on ws://localhost:${config.port}`);
