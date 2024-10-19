@@ -2,74 +2,102 @@ const WebSocket = require("ws");
 const axios = require("axios");
 const config = require("./config.json");
 
-const totalShards = 1; // Total number of shardsW
+let cachedDiscordGatewayUrl = null;
+let cacheTimestamp = 0;
+const CACHE_EXPIRY = 3600000;
 
-// Function to retrieve the actual Discord WebSocket gateway URL
 async function getDiscordGatewayUrl() {
-	const response = await axios.get("https://discord.com/api/v10/gateway/bot", {
-		headers: {
-			Authorization: `Bot ${config.token}`,
-		},
-	});
-	return response.data.url;
+	const now = Date.now();
+	if (cachedDiscordGatewayUrl && now - cacheTimestamp < CACHE_EXPIRY) {
+		return cachedDiscordGatewayUrl;
+	}
+
+	try {
+		const response = await axios.get("https://discord.com/api/v10/gateway/bot", {
+			headers: {
+				Authorization: `Bot ${config.token}`,
+			},
+		});
+		cachedDiscordGatewayUrl = response.data.url;
+		cacheTimestamp = now;
+		return cachedDiscordGatewayUrl;
+	} catch (error) {
+		console.error("Failed to retrieve Discord Gateway URL:", error);
+		throw new Error("Unable to get Discord Gateway URL");
+	}
 }
 
-// Start the WebSocket server for your proxy
-const wss = new WebSocket.Server({ port: 8080 });
-
-// Hold shard connections by shardId
+const wss = new WebSocket.Server({ port: config.port });
 const shardConnections = new Map();
+const availableShards = [...Array(config.totalShards).keys()];
 
-wss.on("connection", async (clientSocket, request) => {
+wss.on("connection", async (clientSocket) => {
 	console.log("Client connected to the proxy");
 
-	// Extract the shard ID from the request (could be passed as a query parameter)
-	const shardId = parseInt(new URL(request.url, `http://${request.headers.host}`).searchParams.get("shardId"), 10);
-
-	if (isNaN(shardId) || shardId < 0 || shardId >= totalShards) {
-		clientSocket.close(1008, "Invalid shard ID");
+	if (availableShards.length === 0) {
+		clientSocket.close(1008, "No available shards");
 		return;
 	}
 
-	// Check if there's already a connection for the given shard
-	if (shardConnections.has(shardId)) {
-		clientSocket.close(1008, "Shard already connected");
-		return;
+	const shardId = availableShards.shift();
+
+	try {
+		const discordWsUrl = await getDiscordGatewayUrl();
+		const discordSocket = new WebSocket(`${discordWsUrl}?v=10&encoding=json`);
+		shardConnections.set(shardId, { discordSocket, clientSocket });
+
+		// Handle Discord WebSocket events
+		discordSocket.on("message", (message) => {
+			try {
+				const jsonMessage = JSON.parse(message);
+				clientSocket.send(JSON.stringify(jsonMessage));
+			} catch (error) {
+				console.error("Failed to parse message from Discord:", error);
+			}
+		});
+
+		discordSocket.on("close", (code, reason) => {
+			console.log(`Discord WebSocket for Shard ${shardId} closed: ${code} ${reason}`);
+			clientSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+
+		discordSocket.on("error", (error) => {
+			console.error(`Discord WebSocket for Shard ${shardId} error:`, error);
+			clientSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+
+		// Handle client WebSocket events
+		clientSocket.on("message", (message) => {
+			try {
+				const jsonMessage = JSON.parse(message);
+				discordSocket.send(JSON.stringify(jsonMessage));
+			} catch (error) {
+				console.error("Failed to parse message from client:", error);
+			}
+		});
+
+		clientSocket.on("close", () => {
+			console.log(`Client for Shard ${shardId} disconnected`);
+			discordSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+
+		clientSocket.on("error", (error) => {
+			console.error(`Client WebSocket for Shard ${shardId} error:`, error);
+			discordSocket.close();
+			shardConnections.delete(shardId);
+			availableShards.push(shardId);
+		});
+	} catch (error) {
+		console.error("Error during connection handling:", error);
+		clientSocket.close(1011, "Internal server error");
+		availableShards.push(shardId);
 	}
-
-	// Get the Discord Gateway URL
-	const discordWsUrl = await getDiscordGatewayUrl();
-
-	// Create a connection to the real Discord gateway for this shard
-	const discordSocket = new WebSocket(`${discordWsUrl}?v=10&encoding=json`);
-
-	shardConnections.set(shardId, { discordSocket, clientSocket });
-
-	// Handle messages from Discord WebSocket to client
-	discordSocket.on("message", (message) => {
-		console.log(`Message from Discord (Shard ${shardId}):`, message);
-		clientSocket.send(message); // Forward message to the client
-	});
-
-	// Handle messages from client to Discord WebSocket
-	clientSocket.on("message", (message) => {
-		console.log(`Message from Client (Shard ${shardId}):`, message);
-		discordSocket.send(message); // Forward message to Discord
-	});
-
-	// Handle Discord WebSocket close event
-	discordSocket.on("close", (code, reason) => {
-		console.log(`Discord WebSocket for Shard ${shardId} closed: ${code} ${reason}`);
-		clientSocket.close(); // Close client connection as well
-		shardConnections.delete(shardId);
-	});
-
-	// Handle client WebSocket close event
-	clientSocket.on("close", () => {
-		console.log(`Client for Shard ${shardId} disconnected`);
-		discordSocket.close(); // Close Discord connection as well
-		shardConnections.delete(shardId);
-	});
 });
 
-console.log("Proxy WebSocket server running on ws://localhost:8080");
+console.log(`Proxy WebSocket server running on ws://localhost:${config.port}`);
