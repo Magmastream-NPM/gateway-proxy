@@ -1,159 +1,178 @@
-const WebSocket = require("ws");
-const config = require("./config.json");
-const cluster = require("cluster");
-const os = require("os");
-const { getDiscordGatewayUrl } = require("./src/getDiscordGatewayUrl");
-const { delay } = require("./src/delay");
-const { Intents } = require("./src/intents");
+const { WebSocketServer, WebSocket } = require("ws");
+const { WebSocketManager, DefaultWebSocketManagerOptions } = require("@discordjs/ws");
+const { REST } = require("@discordjs/rest");
+const { token, intents } = require("./config");
+const { GatewayOpcodes } = require("discord-api-types/v10");
 
-if (cluster.isMaster) {
-	const numCPUs = os.cpus().length;
+const rest = new REST().setToken(token);
 
-	console.log(`Master process is running with ${numCPUs} CPUs`);
+const manager = new WebSocketManager({
+	token,
+	intents,
+	rest,
+	...DefaultWebSocketManagerOptions,
+});
 
-	for (let i = 0; i < numCPUs; i++) {
-		cluster.fork();
+const wss = new WebSocketServer({ port: 8080 });
+let client = null; // Track the connected client
+
+// Session and sequence management
+let sessionId = null;
+let sequence = null;
+let wasClientConnected = false; // Track if a client was recently connected
+
+// Heartbeat interval management for Discord gateway
+let heartbeatInterval = null;
+let awaitingHeartbeatAck = false;
+
+// Ensure the shard is spawned before sending Identify/Resume
+async function initializeShard() {
+	console.log("Initializing shard and connecting to Discord gateway...");
+	await manager.connect();
+	console.log("Shard initialized and connected.");
+}
+
+// Start connection to Discord gateway with Resume or Identify
+async function connectToGateway() {
+	console.log("Connecting to Discord gateway with Resume or Identify...");
+	if (sessionId && sequence !== null) {
+		const resumePayload = {
+			op: GatewayOpcodes.Resume,
+			d: {
+				token,
+				session_id: sessionId,
+				seq: sequence,
+			},
+		};
+		console.log("Sending Resume payload:", resumePayload);
+		await manager.send(0, resumePayload);
+	} else {
+		await sendIdentify(); // Send Identify if no previous session exists
+	}
+}
+
+// Function to send Identify payload
+async function sendIdentify() {
+	const identifyPayload = {
+		op: GatewayOpcodes.Identify,
+		d: {
+			token,
+			intents,
+			properties: {
+				os: process.platform,
+				browser: "my_library",
+				device: "my_library",
+			},
+		},
+	};
+	console.log("Sending Identify payload:", identifyPayload);
+	await manager.send(0, identifyPayload);
+}
+
+// Set up WebSocket server
+wss.on("connection", (ws) => {
+	console.log("Client connected to the proxy");
+	client = ws;
+
+	if (wasClientConnected) {
+		// Destroy existing gateway connection only if a client was previously connected
+		manager.destroy().then(() => {
+			console.log("Destroyed existing gateway connection due to client reconnect.");
+			initializeShard().then(connectToGateway); // Spawn shard and connect with Resume/Identify
+		});
+	} else {
+		// First connection: initialize shard and connect directly
+		initializeShard().then(connectToGateway);
 	}
 
-	cluster.on("exit", (worker, code, signal) => {
-		console.log(`Worker ${worker.process.pid} died, restarting...`);
-		cluster.fork();
-	});
-} else {
-	const wss = new WebSocket.Server({ port: config.port });
-	const shardConnections = new Map();
-	const availableShards = [...Array(config.totalShards).keys()];
-	const sessionInfo = new Map();
+	// Mark client as recently connected
+	wasClientConnected = true;
 
-	wss.on("connection", async (clientSocket) => {
-		console.log("Client connected to the proxy");
-
-		if (availableShards.length === 0) {
-			clientSocket.close(1008, "No available shards");
-			return;
-		}
-
-		const shardId = availableShards.shift();
-
+	// Forward client messages to Discord
+	ws.on("message", async (message) => {
 		try {
-			const discordWsUrl = await getDiscordGatewayUrl();
-
-			await delay(shardId * 5500);
-
-			const connectToDiscord = (resume = false) => {
-				const params = new URLSearchParams({
-					v: "10",
-					encoding: "json",
-				});
-				if (resume) {
-					const session = sessionInfo.get(shardId);
-					if (session) {
-						params.append("session_id", session.sessionId);
-						params.append("seq", session.sequence.toString());
-					}
-				}
-				return new WebSocket(`${discordWsUrl}?${params}`);
-			};
-
-			let discordSocket = connectToDiscord();
-
-			shardConnections.set(shardId, { discordSocket, clientSocket });
-
-			// Handle Discord WebSocket events
-			discordSocket.on("message", (message) => {
-				try {
-					const jsonMessage = JSON.parse(message);
-					if (jsonMessage.op === 0) {
-						// Dispatch
-						if (jsonMessage.t === "READY") {
-							sessionInfo.set(shardId, {
-								sessionId: jsonMessage.d.session_id,
-								sequence: jsonMessage.s,
-							});
-						} else if (jsonMessage.s) {
-							const session = sessionInfo.get(shardId);
-							if (session) {
-								session.sequence = jsonMessage.s;
-							}
-						}
-					}
-					clientSocket.send(JSON.stringify(jsonMessage));
-				} catch (error) {
-					console.error("Failed to parse message from Discord:", error);
-				}
-			});
-
-			discordSocket.on("close", (code, reason) => {
-				console.log(`Discord WebSocket for Shard ${shardId} closed: ${code} ${reason}`);
-				if (code === 4000) {
-					// Unknown error, try to resume
-					discordSocket = connectToDiscord(true);
-				} else {
-					clientSocket.close();
-					shardConnections.delete(shardId);
-					sessionInfo.delete(shardId);
-					availableShards.push(shardId);
-				}
-			});
-
-			discordSocket.on("error", (error) => {
-				console.error(`Discord WebSocket for Shard ${shardId} error:`, error);
-				clientSocket.close();
-				shardConnections.delete(shardId);
-				sessionInfo.delete(shardId);
-				availableShards.push(shardId);
-			});
-
-			// Handle client WebSocket events
-			clientSocket.on("message", (message) => {
-				try {
-					const jsonMessage = JSON.parse(message);
-					if (jsonMessage.op === 2) {
-						// Identify
-						const intents =
-							Intents.GUILDS |
-							Intents.GUILD_MEMBERS |
-							Intents.GUILD_MODERATION |
-							Intents.GUILD_EXPRESSIONS |
-							Intents.GUILD_INTEGRATIONS |
-							Intents.GUILD_INVITES |
-							Intents.GUILD_VOICE_STATES |
-							Intents.GUILD_MESSAGES |
-							Intents.MESSAGE_CONTENT |
-							Intents.GUILD_SCHEDULED_EVENTS |
-							Intents.AUTO_MODERATION_CONFIGURATION |
-							Intents.AUTO_MODERATION_EXECUTION |
-							Intents.DIRECT_MESSAGES;
-
-						jsonMessage.d.intents = intents;
-					}
-					discordSocket.send(JSON.stringify(jsonMessage));
-				} catch (error) {
-					console.error("Failed to parse message from client:", error);
-				}
-			});
-
-			clientSocket.on("close", () => {
-				console.log(`Client for Shard ${shardId} disconnected`);
-				discordSocket.close();
-				shardConnections.delete(shardId);
-				sessionInfo.delete(shardId);
-				availableShards.push(shardId);
-			});
-
-			clientSocket.on("error", (error) => {
-				console.error(`Client WebSocket for Shard ${shardId} error:`, error);
-				discordSocket.close();
-				shardConnections.delete(shardId);
-				sessionInfo.delete(shardId);
-				availableShards.push(shardId);
-			});
+			const data = JSON.parse(message);
+			console.log("Message received from client:", data);
+			await manager.send(0, data); // Forward all client messages to Discord
 		} catch (error) {
-			console.error("Error during connection handling:", error);
-			clientSocket.close(1011, "Internal server error");
-			availableShards.push(shardId);
+			console.error("Error parsing client message:", error);
 		}
 	});
 
-	console.log(`Worker ${process.pid} started WebSocket server on ws://localhost:${config.port}`);
+	ws.on("close", () => {
+		console.log("Client disconnected from the proxy");
+		client = null;
+		wasClientConnected = false; // Update flag since client is no longer connected
+		manager.destroy(); // Clean up connection on client disconnect
+		clearGatewayHeartbeat(); // Stop gateway heartbeat
+	});
+});
+
+// Heartbeat management for Discord gateway
+function startGatewayHeartbeat(interval) {
+	clearGatewayHeartbeat();
+	heartbeatInterval = setInterval(() => {
+		if (awaitingHeartbeatAck) {
+			console.log("Heartbeat ACK not received, reconnecting...");
+			reconnectGateway();
+		} else {
+			console.log("Sending Heartbeat to Discord gateway");
+			awaitingHeartbeatAck = true;
+			manager.send(0, { op: GatewayOpcodes.Heartbeat, d: sequence });
+		}
+	}, interval);
 }
+
+// Stop gateway heartbeat
+function clearGatewayHeartbeat() {
+	if (heartbeatInterval) {
+		clearInterval(heartbeatInterval);
+		heartbeatInterval = null;
+	}
+}
+
+// Reconnect to the Discord gateway
+async function reconnectGateway() {
+	clearGatewayHeartbeat();
+	await manager.destroy();
+	console.log("Reconnecting to the gateway...");
+	initializeShard().then(connectToGateway);
+}
+
+// Track session and sequence on relevant Discord events
+manager.on("dispatch", (payload, shardId) => {
+	console.log("Event received from Discord:", payload.t);
+
+	if (payload.op === GatewayOpcodes.Hello) {
+		console.log("Received HELLO, starting gateway heartbeat");
+		startGatewayHeartbeat(payload.d.heartbeat_interval);
+	}
+
+	if (payload.op === GatewayOpcodes.HeartbeatAck) {
+		console.log("Received Heartbeat ACK from Discord gateway");
+		awaitingHeartbeatAck = false;
+	}
+
+	if (payload.t === "READY" || payload.t === "RESUMED") {
+		if (!heartbeatInterval) {
+			// If HELLO was not received, start the heartbeat using an estimated interval
+			console.log("Starting gateway heartbeat from READY or RESUMED");
+			startGatewayHeartbeat(41250); // Approximate default interval (41.25s)
+		}
+		sessionId = payload.d.session_id;
+		sequence = payload.s;
+		console.log("Session ID set:", sessionId, "Sequence:", sequence);
+	}
+
+	// Track sequence for each event to ensure resumption accuracy
+	if (payload.s !== null) {
+		sequence = payload.s;
+	}
+
+	// Forward all messages from Discord to the client
+	if (client && client.readyState === WebSocket.OPEN) {
+		client.send(JSON.stringify(payload));
+	}
+});
+
+console.log("WebSocket proxy server started on ws://localhost:8080");

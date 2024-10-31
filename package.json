@@ -3,16 +3,15 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "axios": "^1.7.7",
-    "cluster": "^0.7.7",
-    "os": "^0.1.2",
+    "@discordjs/rest": "^2.4.0",
+    "@discordjs/ws": "^2.0.0",
+    "discord-api-types": "^0.37.103",
     "ws": "^8.18.0"
   }
 }
