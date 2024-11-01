@@ -35,7 +35,7 @@ async function initializeShard() {
 // Start connection to Discord gateway with Resume or Identify
 async function connectToGateway() {
 	console.log("Connecting to Discord gateway with Resume or Identify...");
-	if (sessionId && sequence !== null) {
+	if (wasClientConnected) {
 		const resumePayload = {
 			op: GatewayOpcodes.Resume,
 			d: {
@@ -48,6 +48,8 @@ async function connectToGateway() {
 		await manager.send(0, resumePayload);
 	} else {
 		await sendIdentify(); // Send Identify if no previous session exists
+
+		wasClientConnected = true; // Mark client as recently connected
 	}
 }
 
@@ -78,15 +80,13 @@ wss.on("connection", (ws) => {
 		// Destroy existing gateway connection only if a client was previously connected
 		manager.destroy().then(() => {
 			console.log("Destroyed existing gateway connection due to client reconnect.");
+			clearGatewayHeartbeat(); // Stop gateway heartbeat
 			initializeShard().then(connectToGateway); // Spawn shard and connect with Resume/Identify
 		});
 	} else {
 		// First connection: initialize shard and connect directly
 		initializeShard().then(connectToGateway);
 	}
-
-	// Mark client as recently connected
-	wasClientConnected = true;
 
 	// Forward client messages to Discord
 	ws.on("message", async (message) => {
@@ -102,9 +102,6 @@ wss.on("connection", (ws) => {
 	ws.on("close", () => {
 		console.log("Client disconnected from the proxy");
 		client = null;
-		wasClientConnected = false; // Update flag since client is no longer connected
-		manager.destroy(); // Clean up connection on client disconnect
-		clearGatewayHeartbeat(); // Stop gateway heartbeat
 	});
 });
 
@@ -154,11 +151,6 @@ manager.on("dispatch", (payload, shardId) => {
 	}
 
 	if (payload.t === "READY" || payload.t === "RESUMED") {
-		if (!heartbeatInterval) {
-			// If HELLO was not received, start the heartbeat using an estimated interval
-			console.log("Starting gateway heartbeat from READY or RESUMED");
-			startGatewayHeartbeat(41250); // Approximate default interval (41.25s)
-		}
 		sessionId = payload.d.session_id;
 		sequence = payload.s;
 		console.log("Session ID set:", sessionId, "Sequence:", sequence);
